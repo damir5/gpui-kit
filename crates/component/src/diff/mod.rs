@@ -22,8 +22,8 @@ use gpui::{
     AnyElement, App, Axis, ClickEvent, ClipboardItem, Context, ElementId, Entity, Focusable as _,
     HighlightStyle, Hsla, InteractiveElement as _, IntoElement, KeyBinding, ListOffset,
     MouseButton, ParentElement as _, Pixels, RenderOnce, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled, TextRun, Window, div, list, point,
-    prelude::FluentBuilder as _, px,
+    StatefulInteractiveElement as _, StyleRefinement, Styled, TextRun, UnderlineStyle, Window, div,
+    list, point, prelude::FluentBuilder as _, px,
 };
 use gpui_base::TestSupportExt as _;
 use rust_i18n::t;
@@ -34,6 +34,7 @@ use crate::{
     h_flex,
     input::{Copy, SelectAll},
     scroll::{ScrollableMask, Scrollbar},
+    tooltip::Tooltip,
     v_flex,
 };
 use actions::*;
@@ -171,6 +172,37 @@ impl DiffAnnotation {
     }
 }
 
+/// A wavy underline under a source line's text, with an optional hover message,
+/// drawn like an editor diagnostic.
+///
+/// Several marks may target one line: the first sets the color and the
+/// messages are shown together.
+#[derive(Clone)]
+pub struct DiffLineMark {
+    position: DiffLinePosition,
+    color: Hsla,
+    message: Option<SharedString>,
+}
+
+impl DiffLineMark {
+    pub fn new(position: DiffLinePosition, color: Hsla) -> Self {
+        Self {
+            position,
+            color,
+            message: None,
+        }
+    }
+    /// Text shown when the pointer rests on the line.
+    pub fn message(mut self, message: impl Into<SharedString>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+    pub fn position(&self) -> &DiffLinePosition {
+        &self.position
+    }
+}
+
+type LineMarks = HashMap<DiffLinePosition, Vec<DiffLineMark>>;
 type FileRenderer = Rc<dyn Fn(&DiffFile, &mut Window, &mut App) -> AnyElement>;
 type AnnotationRenderer = Rc<dyn Fn(&DiffAnnotation, &mut Window, &mut App) -> AnyElement>;
 type RangeHandler = Rc<dyn Fn(&DiffLineRange, &mut Window, &mut App)>;
@@ -217,6 +249,7 @@ pub struct Diff {
     on_add_annotation: Option<RangeHandler>,
     on_line_click: Option<ClickHandler>,
     on_line_hover: Option<HoverHandler>,
+    line_marks: Rc<LineMarks>,
 }
 
 fn file_renderer<F, E>(render: F) -> FileRenderer
@@ -246,6 +279,7 @@ impl Diff {
             on_add_annotation: None,
             on_line_click: None,
             on_line_hover: None,
+            line_marks: Rc::default(),
         }
     }
     /// Shows the original and modified line-number lanes. Default is true.
@@ -422,6 +456,15 @@ impl Diff {
         self.on_line_click = Some(Rc::new(handler));
         self
     }
+    /// Underlines the text of each marked source line; see [`DiffLineMark`].
+    pub fn line_marks(mut self, marks: impl IntoIterator<Item = DiffLineMark>) -> Self {
+        let mut index = LineMarks::new();
+        for mark in marks {
+            index.entry(mark.position.clone()).or_default().push(mark);
+        }
+        self.line_marks = Rc::new(index);
+        self
+    }
     /// Reports the line under the pointer, or `None` when the pointer leaves it.
     pub fn on_line_hover<F>(mut self, handler: F) -> Self
     where
@@ -526,6 +569,7 @@ fn render_diff(
         on_add_annotation: props.on_add_annotation,
         on_line_click: props.on_line_click,
         on_line_hover: props.on_line_hover,
+        line_marks: props.line_marks,
         selection: state.selection().clone(),
         selected_lines: state.selected_lines(),
         selected: state.selected_span(),
@@ -761,6 +805,7 @@ struct CodePresentation {
     on_add_annotation: Option<RangeHandler>,
     on_line_click: Option<ClickHandler>,
     on_line_hover: Option<HoverHandler>,
+    line_marks: Rc<LineMarks>,
     selection: gpui_base::TextSelectionHandle,
     selected_lines: Option<DiffLineRange>,
     selected: Option<SelectedLines>,
@@ -1486,6 +1531,23 @@ fn line_highlights(
             )
         }));
     }
+    if let Some(mark) = code
+        .line_marks
+        .get(&code.position(file, side, ix))
+        .and_then(|marks| marks.first())
+    {
+        highlights.push((
+            0..line.display().len(),
+            HighlightStyle {
+                underline: Some(UnderlineStyle {
+                    color: Some(mark.color),
+                    thickness: px(1.),
+                    wavy: true,
+                }),
+                ..Default::default()
+            },
+        ));
+    }
     if selected {
         highlights.push((
             0..line.display().len(),
@@ -1602,6 +1664,13 @@ fn code_line(
         (side, ix)
     };
     let position = code.position(file, text_side, text_ix);
+    let mark_message: Option<SharedString> = code.line_marks.get(&position).and_then(|marks| {
+        let messages: Vec<_> = marks
+            .iter()
+            .filter_map(|mark| mark.message.as_deref())
+            .collect();
+        (!messages.is_empty()).then(|| messages.join("\n").into())
+    });
     let source_line = &document.lines(text_side)[text_ix];
     // Wrapped text must be one run to break across the column; unwrapped
     // long lines stay chunked to bound shaping and selection projection.
@@ -1743,6 +1812,9 @@ fn code_line(
                         }
                         handler(&position, event, window, cx)
                     })
+                })
+                .when_some(mark_message, |this, message| {
+                    this.tooltip(move |window, cx| Tooltip::new(message.clone()).build(window, cx))
                 })
                 .child(text),
         )
